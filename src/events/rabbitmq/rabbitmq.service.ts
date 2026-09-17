@@ -1,0 +1,154 @@
+import {
+    Injectable,
+    Logger,
+    OnModuleDestroy,
+    OnModuleInit
+} from '@nestjs/common';
+import * as amqp from 'amqplib'
+import { ConfigService } from '@nestjs/config'
+
+@Injectable()
+export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
+    private readonly logger = new Logger(RabbitmqService.name)
+    private connection: amqp.ChannelModel;
+    private channel: amqp.Channel
+
+    constructor(private configService: ConfigService) { }
+
+    async onModuleInit() {
+        await this.connect()
+    }
+    async onModuleDestroy() {
+        await this.disConnect()
+    }
+
+    async connect() {
+        const rabbitmqUrl = this.configService.get<string>(
+            'RABBITMQ_URL',
+            'amqp://admin:admin@localhost:5672')
+
+        try {
+            this.connection = await amqp.connect(rabbitmqUrl)
+            this.channel = await this.connection.createChannel()
+            this.logger.log('Conected to RabbitMQ sucessfully')
+
+            this.connection.on('error', () => {
+                this.logger.error('RabbitMQ connection Error')
+            })
+
+            this.connection.on('close', () => {
+                this.logger.warn('RabbitMQ connection Close')
+            })
+
+            this.connection.on('blocked', () => {
+                this.logger.warn('RabbitMQ connection Blocked')
+            })
+
+            this.connection.on('unblocked', () => {
+                this.logger.log('RabbitMQ connection unBlocked')
+            })
+        } catch (error) {
+            this.logger.warn('Failed to connect to RabbitMQ, continuing without message queue', error)
+        }
+    }
+
+    async disConnect() {
+        try {
+            if (this.channel) {
+                await this.channel.close()
+                this.logger.log('RabbirMQ channel closed')
+            }
+
+            if (this.connection) {
+                await this.connection.close()
+                this.logger.log('Disconnected from RabbirMQ')
+            }
+        } catch (error) {
+            this.logger.warn('Error disconnecting from RabbitMQ', error)
+        }
+    }
+
+    getChannel(): amqp.Channel {
+        return this.channel
+    }
+
+    getConnection(): amqp.ChannelModel {
+        return this.connection
+    }
+
+    async publishMessage(exchange: string, routingKey: string, message: unknown): Promise<void> {
+        try {
+            if (!this.channel) {
+                this.logger.warn('RabbitMQ channel not available, skipping message publish')
+                return
+            }
+
+            await this.channel.assertExchange(exchange, 'topic', { durable: true })
+            const messageBuffer = Buffer.from(JSON.stringify(message))
+
+            const published = this.channel.publish(exchange, routingKey, messageBuffer, {
+                persistent: true,
+                timestamp: Date.now(),
+                contentType: 'application/json'
+            })
+
+            if (!published) {
+                throw new Error('Failed to publish message to RabbitMQ')
+            }
+
+            this.logger.log(`Message published to ${exchange}:${routingKey}`)
+            this.logger.debug(`Message content: ${JSON.stringify(message)}`)
+        } catch (error) {
+            this.logger.error('Error publishing message to RabbitMQ')
+        }
+    }
+
+    async subscribeToQueue(
+        queueName: string,
+        exchange: string,
+        routingKey: string,
+        callback: (message: unknown) => Promise<void>): Promise<void> {
+        try {
+
+            if (!this.channel) {
+                this.logger.warn('RabbitMQ channel not available')
+                return
+            }
+
+            await this.channel.assertExchange(exchange, 'topic', { durable: true })
+
+            const queue = await this.channel.assertQueue(queueName, {
+                durable: true,
+                arguments: {
+                    'x-message-ttl': 86400000,
+                    'x-max-length': 10000
+                }
+            })
+
+            await this.channel.bindQueue(queue.queue, exchange, routingKey)
+
+            await this.channel.prefetch(1)
+
+            await this.channel.consume(queue.queue, async (msg) => {
+                if (msg) {
+                    try {
+                        const message =  JSON.parse(msg.content.toString())
+                        this.logger.log(`Message received from queue: ${queueName}`)
+                        this.logger.debug(`Message content: ${JSON.stringify(message)}`)
+                        await callback(message)
+
+                        this.channel.ack(msg)
+
+                        this.logger.log(`Message processed successfully from queue: ${queueName}`)
+                    } catch (error) {
+                      this.logger.error('Error processing message:', error)
+                      this.channel.nack(msg, false, false)
+                    }
+                }
+            })
+
+        } catch (error) {
+            this.logger.error(`Error subscribing to queue ${queueName}`, error)
+        }
+    }
+}
